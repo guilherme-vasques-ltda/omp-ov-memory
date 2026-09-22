@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "OpenViking memory plugin for OMP",
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "plugins": [
     {
       "name": "omp-ov-memory",
       "source": "./",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "Durable memory, recall and cross-agent handoff",
       "license": "Apache-2.0"
     }
