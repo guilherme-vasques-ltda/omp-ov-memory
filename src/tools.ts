@@ -1,5 +1,5 @@
-import { Type, type TSchema } from "@sinclair/typebox";
-import { Value } from "@sinclair/typebox/value";
+import { Type, type TSchema } from "typebox";
+import { Value } from "typebox/value";
 import { createHash, randomUUID } from "node:crypto";
 import { canonicalVikingUri as parseVikingUri, insideVikingRoot, isManagedVikingUri, downloadPublicText } from "./security.ts";
 const StringEnum = (values: readonly string[]) => Type.Union(values.map(value => Type.Literal(value)));
@@ -73,7 +73,7 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
     tool.approval = mutates ? "write" : "read";
     tool.annotations = { readOnlyHint: !mutates, destructiveHint: ["viking_forget", "viking_write", "viking_edit"].includes(tool.name), idempotentHint: !mutates, openWorldHint: true };
     const execute = tool.execute;
-    tool.parameters.additionalProperties = false;
+    (tool.parameters as any).additionalProperties = false;
     api.registerTool({ ...tool, async execute(id: string, params: any, signal?: AbortSignal, onUpdate?: any, ctx?: any) {
       if (!Value.Check(tool.parameters, params)) return failure("Invalid tool arguments; follow the tool's input schema.");
       if (signal?.aborted) return failure("Tool call cancelled.");
