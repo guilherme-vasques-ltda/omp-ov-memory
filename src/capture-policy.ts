@@ -1,10 +1,10 @@
 import { relative, resolve } from "node:path";
 import type { WorkspaceRoute } from "./workspace.ts";
 
-export const CAPTURE_POLICY_VERSION = 1;
+export const CAPTURE_POLICY_VERSION = 2;
 const PATH_KEYS = new Set(["path", "filePath", "file_path", "filepath", "paths", "files"]);
-const SECRET_PATH = /(?:^|[/\\\s"'])(?:\.env(?:\.[a-z0-9._-]+)?|\.ssh|\.aws|\.gnupg|credentials(?:\.json)?|ovcli\.conf|ov\.conf|id_(?:rsa|ed25519))(?=$|[/\\\s"'`;|&])/i;
-const SECRET_TEXT = /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|\bauthorization[\\"'\s]*[:=][\\"'\s]*(?:bearer|basic|token)\s+[^\s"'\\]+|\b[a-z0-9_]*(?:api[_-]?key|access[_-]?token|client[_-]?secret|password|authorization|database_url)["']?\s*[:=]\s*["']?[^\s"']{8,}|\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,})/i;
+const SECRET_PATH = /(?:^|[/\\\s"'])(?:\.env(?:\.[a-z0-9._-]+)?|\.ssh|\.aws|\.gnupg|\.netrc|\.npmrc|\.pgpass|\.kube[/\\]+config|\.docker[/\\]+config\.json|[^/\\\s"']+\.(?:pem|p12|key)|credentials(?:\.json)?|ovcli\.conf|ov\.conf|id_(?:rsa|ed25519))(?=$|[/\\\s"'`;|&])/i;
+const SECRET_TEXT = /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|\bauthorization[\\"'\s]*[:=][\\"'\s]*(?:bearer|basic|token)\s+[^\s"'\\]+|\b[a-z0-9_]*(?:api[_-]?key|access[_-]?token|client[_-]?secret|password|authorization|database_url)["']?\s*[:=]\s*["']?[^\s"']{8,}|\b_authToken[\\"'\s]*=|\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[bp]-[A-Za-z0-9-]+|AKIA[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{35}|glpat-[A-Za-z0-9_-]+)/i;
 
 /** Glob matching uses a bounded dynamic program, not user-supplied regular expressions. */
 export function matchesCapturePattern(path: string, pattern: string): boolean {
@@ -35,6 +35,8 @@ export class CapturePolicy {
   private deny: string[];
   private base: string;
   private deniedCalls = new Set<string>();
+  // A policy instance is immutable. Session + version + ID avoids replay collisions.
+  private entries = new Map<string, {allowed: boolean; chars: number}>();
 
   constructor(config: CaptureOptions, route: WorkspaceRoute) {
     this.mode = route.capture.mode ?? config.captureMode;
@@ -44,9 +46,13 @@ export class CapturePolicy {
   }
 
   allows(value: unknown): boolean {
-    if (this.mode === "off") return false;
     let text: string;
     try { text = JSON.stringify(value) ?? ""; } catch { return false; }
+    return this.allowsText(value, text);
+  }
+
+  private allowsText(value: unknown, text: string): boolean {
+    if (this.mode === "off") return false;
     if (text.length > 1_000_000 || SECRET_TEXT.test(text) || SECRET_PATH.test(text)) return false;
     const paths: string[] = [];
     let hasCommand = false;
@@ -86,14 +92,26 @@ export class CapturePolicy {
     return null;
   }
 
-  filterEntry(entry: any): any | null {
+  filterEntry(entry: any, sessionId = ""): any | null {
     const message = entry?.message;
     if (typeof message?.toolCallId === "string" && this.deniedCalls.has(message.toolCallId)) return null;
+    const key = typeof entry?.id === "string" ? `${CAPTURE_POLICY_VERSION}:${sessionId.length}:${sessionId}:${entry.id}` : null;
+    const cached = key === null ? undefined : this.entries.get(key);
+    if (cached) return cached.allowed ? entry : null;
     const calls = Array.isArray(message?.content) ? message.content.filter((c: any) => c?.type === "toolCall") : [];
     let denied = false;
     for (const call of calls) {
       if (!this.allows(call)) { if (typeof call.id === "string") this.deniedCalls.add(call.id); denied = true; }
     }
-    return !denied && this.allows(entry) ? entry : null;
+    let text: string;
+    try { text = JSON.stringify(entry) ?? ""; } catch { return null; }
+    const allowed = !denied && this.allowsText(entry, text);
+    if (key !== null) this.entries.set(key, {allowed, chars: text.length});
+    return allowed ? entry : null;
+  }
+
+  entryChars(entry: any, sessionId = ""): number {
+    this.filterEntry(entry, sessionId);
+    return this.entries.get(`${CAPTURE_POLICY_VERSION}:${sessionId.length}:${sessionId}:${entry?.id}`)?.chars ?? 0;
   }
 }

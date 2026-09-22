@@ -7,6 +7,7 @@ import { constants } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { OVClient } from "./client.ts";
+import { openVikingApiPath } from "./shared/openviking-api.mjs";
 
 interface NativeMessage {
   role: string;
@@ -161,7 +162,7 @@ export class SessionMirror {
 
   private async metadata(signal?: AbortSignal): Promise<any> {
     this.check(signal);
-    const response = await this.client.fetchJSON<any>(`/api/v1/sessions/${encodeURIComponent(this.sessionId)}`);
+    const response = await this.client.fetchJSON<any>(openVikingApiPath(`/sessions/${encodeURIComponent(this.sessionId)}`));
     if (!response.ok || response.result?.session_id !== this.sessionId || typeof response.result.created_at !== "string" || !Number.isSafeInteger(response.result.commit_count) || response.result.commit_count < 0) throw new MirrorFailure("MIRROR_SESSION_UNAVAILABLE");
     return response.result;
   }
@@ -200,7 +201,7 @@ export class SessionMirror {
     }
     this.current.commitUnknown = true;
     this.check(signal);
-    const response = await this.client.fetchJSON<any>(`/api/v1/sessions/${encodeURIComponent(this.sessionId)}/commit`, {
+    const response = await this.client.fetchJSON<any>(openVikingApiPath(`/sessions/${encodeURIComponent(this.sessionId)}/commit`), {
       method: "POST", body: JSON.stringify({keep_recent_count: 0}),
     });
     if (!response.ok || !response.result || !["accepted", "skipped"].includes(response.result.status)) throw new MirrorFailure("MIRROR_COMMIT_UNKNOWN");
@@ -250,7 +251,7 @@ export class SessionMirror {
 
   private async inspectRemote(wanted: Set<string>, signal?: AbortSignal): Promise<RemoteView> {
     this.check(signal);
-    const path = `/api/v1/sessions/${encodeURIComponent(this.sessionId)}`;
+    const path = openVikingApiPath(`/sessions/${encodeURIComponent(this.sessionId)}`);
     const metadata = await this.client.fetchJSON<any>(path);
     if (!metadata.ok || !metadata.result || metadata.result.session_id !== this.sessionId || typeof metadata.result.created_at !== "string") throw new MirrorFailure("MIRROR_SESSION_UNAVAILABLE");
     this.check(signal);
@@ -270,7 +271,7 @@ export class SessionMirror {
       // The deployed server truncates active messages to the context budget,
       // including returning none for token_budget=0. Read the source JSONL.
       this.check(signal);
-      const raw = await this.client.fetchJSON<string>(`/api/v1/content/read?${new URLSearchParams({uri: `${root}/messages.jsonl`, raw: "true"})}`);
+      const raw = await this.client.fetchJSON<string>(openVikingApiPath(`/content/read?${new URLSearchParams({uri: `${root}/messages.jsonl`, raw: "true"})}`));
       if (!raw.ok || typeof raw.result !== "string") throw new MirrorFailure("MIRROR_INCOMPLETE_REMOTE_VIEW");
       const messages = raw.result.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
       this.addProofs(messages, proofs, nativeIds);
@@ -281,7 +282,7 @@ export class SessionMirror {
     const pageSize = 1000;
     for (let offset = 0; offset <= 10000; offset += pageSize) {
       this.check(signal);
-      const listing = await this.client.fetchJSON<any[]>(`/api/v1/fs/ls?${new URLSearchParams({ uri: `${root}/history`, output: "original", node_limit: String(pageSize), offset: String(offset), sort_by: "name", sort_order: "asc" })}`);
+      const listing = await this.client.fetchJSON<any[]>(openVikingApiPath(`/fs/ls?${new URLSearchParams({ uri: `${root}/history`, output: "original", node_limit: String(pageSize), offset: String(offset), sort_by: "name", sort_order: "asc" })}`));
       if (listing.status === 404 && offset === 0) break;
       if (!listing.ok || !Array.isArray(listing.result)) throw new MirrorFailure("MIRROR_INCOMPLETE_REMOTE_VIEW");
       for (const item of listing.result) {
@@ -301,7 +302,7 @@ export class SessionMirror {
       else if (archive.status === 404) {
         // Native commits publish raw messages before their asynchronous summary is done.
         // The archive API deliberately hides those not-yet-complete archives.
-        const raw = await this.client.fetchJSON<string>(`/api/v1/content/read?${new URLSearchParams({ uri: `${root}/history/${archiveId}/messages.jsonl`, raw: "true" })}`);
+        const raw = await this.client.fetchJSON<string>(openVikingApiPath(`/content/read?${new URLSearchParams({ uri: `${root}/history/${archiveId}/messages.jsonl`, raw: "true" })}`));
         if (!raw.ok || typeof raw.result !== "string") throw new MirrorFailure("MIRROR_INCOMPLETE_REMOTE_VIEW");
         this.addProofs(raw.result.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line)), proofs, nativeIds);
       } else throw new MirrorFailure("MIRROR_INCOMPLETE_REMOTE_VIEW");
@@ -353,7 +354,7 @@ export class SessionMirror {
       }
       this.current.unknown++;
       this.check(signal);
-      const response = await this.client.fetchJSON(`/api/v1/sessions/${encodeURIComponent(this.sessionId)}/messages`, { method: "POST", body: JSON.stringify(body) });
+      const response = await this.client.fetchJSON(openVikingApiPath(`/sessions/${encodeURIComponent(this.sessionId)}/messages`), { method: "POST", body: JSON.stringify(body) });
       if (!response.ok) throw new MirrorFailure("MIRROR_OUTCOME_UNKNOWN");
       const verified = await this.inspectRemote(new Set([sourceId]), signal);
       if (verified.birth !== intent.birth) throw new MirrorFailure("MIRROR_SESSION_REPLACED");

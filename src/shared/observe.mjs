@@ -69,20 +69,25 @@ const HTTP_ROUTES = [
     "/content/download",
     "/content/overview",
     "/content/read",
+    "/content/write",
     "/fs",
     "/fs/ls",
     "/fs/mkdir",
     "/fs/stat",
+    "/fs/tree",
     "/resources",
+    "/resources/temp_upload",
     "/search/find",
     "/search/search",
     "/sessions",
     "/sessions/{id}",
     "/sessions/{id}/commit",
+    "/sessions/{id}/extract",
     "/sessions/{id}/context",
     "/sessions/{id}/messages",
     "/tasks",
     "/tasks/{id}",
+    "/tasks/{id}/cancel",
     "/system/status",
   ].map(openVikingApiPath),
   "other",
@@ -95,6 +100,10 @@ const TOOLS = [
   "viking_forget",
   "viking_add_resource",
   "viking_archive_expand",
+  "viking_tree",
+  "viking_write",
+  "viking_edit",
+  "viking_health",
   "read",
   "grep",
   "find",
@@ -407,7 +416,7 @@ export const OBSERVATION_STAGE_REGISTRY = deepFreeze({
   })),
   tool_scope: stage("tools.ts", "decision", schema({
     tool: ENUM(TOOLS),
-    operation: ENUM(["archive", "browse", "delete", "read", "resource_add", "search_request", "search_result"]),
+    operation: ENUM(["archive", "browse", "delete", "write", "read", "resource_add", "search_request", "search_result"]),
     scoped: BOOLEAN,
     branch: ENUM(["allow", "deny", "clamp", "filter"]),
     accepted: INTEGER(),
@@ -1280,6 +1289,7 @@ function routeTemplate(path) {
     if (parts.length === 2 && parts[0] && parts[1] === "commit") {
       return openVikingApiPath("/sessions/{id}/commit");
     }
+    if (parts.length === 2 && parts[0] && parts[1] === "extract") return openVikingApiPath("/sessions/{id}/extract");
     if (parts.length === 2 && parts[0] && parts[1] === "context") {
       return openVikingApiPath("/sessions/{id}/context");
     }
@@ -1288,6 +1298,7 @@ function routeTemplate(path) {
   if (pathname.startsWith(taskPrefix)) {
     const parts = pathname.slice(taskPrefix.length).split("/");
     if (parts.length === 1 && parts[0]) return openVikingApiPath("/tasks/{id}");
+    if (parts.length === 2 && parts[0] && parts[1] === "cancel") return openVikingApiPath("/tasks/{id}/cancel");
   }
   return HTTP_ROUTES.includes(pathname) ? pathname : "other";
 }

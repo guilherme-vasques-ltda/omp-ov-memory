@@ -4,7 +4,7 @@ import { Value } from 'typebox/value';
 import { createTools, VIKING_TOOL_NAMES } from '../src/tools.ts';
 import { canonicalVikingUri, isPublicAddress, validatePublicUrl, downloadPublicText } from '../src/security.ts';
 
-function fixture(overrides = {}, sync = null) {
+function fixture(overrides = {}, sync = null, observe = {emit() {}}) {
   const calls = [];
   const client = {
     cfg: { sessionScopedMemory: true, recallMaxContentChars: 1000 }, userRoot: 'viking://user/alice', baseUserRoot: 'viking://user/alice', connected: true,
@@ -19,7 +19,7 @@ function fixture(overrides = {}, sync = null) {
     stat: async (...args) => { calls.push(['stat', ...args]); return { isDir: true }; },
     ...overrides,
   };
-  const tools = new Map(createTools(client, sync, { emit() {} }).map(tool => [tool.name, tool]));
+  const tools = new Map(createTools(client, sync, observe).map(tool => [tool.name, tool]));
   return { client, calls, tools, call: (name, args = {}) => tools.get(name).execute('1', args, new AbortController().signal) };
 }
 
@@ -28,6 +28,46 @@ test('registers exactly eleven shared tools with JSON schemas', () => {
   assert.equal(tools.size, 11);
   assert.deepEqual([...tools.keys()], [...VIKING_TOOL_NAMES]);
   for (const tool of tools.values()) assert.equal(tool.parameters.additionalProperties, false);
+});
+
+test('published tool JSON schemas contain no TypeBox internal keys', () => {
+  const { tools } = fixture();
+  const check = value => {
+    if (!value || typeof value !== 'object') return;
+    for (const [key, child] of Object.entries(value)) {
+      assert.equal(key.startsWith('~'), false, `internal schema key: ${key}`);
+      check(child);
+    }
+  };
+  for (const tool of tools.values()) check(JSON.parse(JSON.stringify(tool.parameters)));
+});
+
+test('audit attributes write/edit operations and new tools/routes without other fallback', async t => {
+  const {mkdtemp, readFile, rm} = await import('node:fs/promises');
+  const {tmpdir} = await import('node:os');
+  const {join} = await import('node:path');
+  const {createObservation} = await import('../src/shared/observe.mjs');
+  const dir = await mkdtemp(join(tmpdir(), 'ov-audit-'));
+  t.after(() => rm(dir, {recursive: true, force: true}));
+  const file = join(dir, 'audit.jsonl');
+  const observe = createObservation({env: {OV_OBSERVE: file}, autoFinalize: false});
+  const {call} = fixture({}, null, observe);
+  await call('viking_write', {uri: 'viking://user/alice/note.txt', content: 'text'});
+  await call('viking_edit', {uri: 'viking://user/alice/note.txt', old_text: 'hello', new_text: 'hi'});
+  for (const tool of ['viking_tree', 'viking_health']) observe.emit('tool_availability', tool, true);
+  const routes = ['/api/v1/fs/tree', '/api/v1/content/write', '/api/v1/resources/temp_upload', '/api/v1/tasks/fixture/cancel', '/api/v1/sessions/fixture/extract'];
+  for (const route of routes) {
+    const op = observe.begin('client_http', route, 'POST', 2000);
+    observe.end('client_http', op, 'success', 200, undefined);
+  }
+  await observe.finish();
+  const records = (await readFile(file, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(records.some(record => record.data?.tool === 'other' || record.data?.route === 'other'), false);
+  const mutations = records.filter(record => record.stage === 'tool_scope');
+  assert.equal(mutations.length, 2);
+  assert.ok(mutations.every(record => record.data.operation === 'write'));
+  const http = records.filter(record => record.stage === 'client_http' && record.data.phase === 'begin');
+  assert.deepEqual(http.map(record => record.data.route), routes.map(route => route.replace('/fixture/', '/{id}/')));
 });
 
 test('browse defaults to listing the active root through direct and prepared calls', async () => {

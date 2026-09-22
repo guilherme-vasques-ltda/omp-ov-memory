@@ -272,11 +272,12 @@ export class OVClient {
     return res.ok;
   }
 
-  /** Commit only an explicit viking_remember message for memory extraction. */
+  /** Extract memories from the live session (including the remembered message)
+   * without archiving or clearing its backlog. Extraction is session-wide. */
   async commitRememberedMessage(sessionId: string): Promise<boolean> {
     const response = await this.fetchJSON<any>(
-      openVikingApiPath(`/sessions/${encodeURIComponent(sessionId)}/commit`),
-      { method: "POST", body: JSON.stringify({ keep_recent_count: 0 }) },
+      openVikingApiPath(`/sessions/${encodeURIComponent(sessionId)}/extract`),
+      { method: "POST", body: "{}" },
       2000,
     );
     return response.ok;
@@ -496,11 +497,11 @@ export class OVClient {
       let status: number;
       if (this.loopback) {
         this.directAgent ??= new Agent();
-        const response = await undiciRequest(`${this.baseUrl}/api/v1/resources/temp_upload`, { method: "POST", headers, body, signal, dispatcher: this.directAgent });
+        const response = await undiciRequest(`${this.baseUrl}${openVikingApiPath("/resources/temp_upload")}`, { method: "POST", headers, body, signal, dispatcher: this.directAgent });
         status = response.statusCode;
         upload = await response.body.json();
       } else {
-        const response = await fetch(`${this.baseUrl}/api/v1/resources/temp_upload`, { method: "POST", headers, body, signal, redirect: "manual" });
+        const response = await fetch(`${this.baseUrl}${openVikingApiPath("/resources/temp_upload")}`, { method: "POST", headers, body, signal, redirect: "manual" });
         status = response.status;
         upload = await response.json();
       }

@@ -15,13 +15,15 @@ import { buildProfileBlock } from "./shared/profile-inject.mjs";
 import { ensureDirectoryChain } from "./shared/content-objects.mjs";
 
 const hash = (text: string): string => createHash("sha256").update(text).digest("hex");
-export interface SourceSnapshot { entries: any[]; branch: any[]; leafId: string | null }
+export interface SourceSnapshot { entries: any[]; branch: string[]; leafId: string | null }
 interface SyncJob { kind: "sync"; sessionId: string; source: SourceSnapshot; taskModel: TaskModelContext | null }
 interface HookJob { kind: "hook"; sessionId: string; id: string; event: string; payload: Record<string, any> }
 type PendingJob = SyncJob | HookJob;
 
 function sourceView(source: SourceSnapshot): any {
-  return { isPersisted: () => false, getEntries: () => source.entries, getBranch: () => source.branch,
+  const byId = new Map(source.entries.map(entry => [entry.id, entry]));
+  const branch = source.branch.map(id => byId.get(id)).filter(Boolean);
+  return { isPersisted: () => false, getEntries: () => source.entries, getBranch: () => branch,
     getLeafId: () => source.leafId, getSessionFile: () => undefined };
 }
 
@@ -46,6 +48,8 @@ export class MemoryRuntime {
   private context: any;
   private lastQueuedLeaf: string | null | undefined;
   private committedChars = 0;
+  private capturedChars = 0;
+  private countedEntries = new Set<string>();
   private commitInFlight: Promise<boolean> | null = null;
   private taskModel: TaskModelContext | null = null;
   private readonly dependencies: { Client: typeof OVClient; Sync: typeof SyncManager };
@@ -59,7 +63,7 @@ export class MemoryRuntime {
     this.sharedClient = new dependencies.Client(this.config, this.observation);
     if (config.sessionScopedMemory) this.client.bindScope(deriveSessionScope(sessionId, route));
     this.policy = new CapturePolicy(this.config, route);
-    this.sync = new dependencies.Sync(this.client, { stateDir: config.stateDir, namespaceKey: route.scopeKey, observation: this.observation, filterEntry: entry => this.policy.filterEntry(entry) });
+    this.sync = new dependencies.Sync(this.client, { stateDir: config.stateDir, namespaceKey: route.scopeKey, observation: this.observation, filterEntry: entry => this.policy.filterEntry(entry, this.sessionId) });
     this.ledger = new RecallLedger(config.stateDir, [this.client.recordedEventTarget, hash(config.apiKey), route.scopeKey, sessionId]);
     this.recall = new RecallManager(this.client, this.config, () => this.sync.sessionId, this.observation, this.ledger);
     this.queue = new HookQueue<PendingJob>({
@@ -68,6 +72,7 @@ export class MemoryRuntime {
       identity: [this.sharedClient.recordedEventTarget, hash(config.apiKey), route.scopeKey],
       handler: (job, signal) => this.deliver(job, signal),
       filter: job => this.filterJob(job),
+      coalesceKey: job => job.kind === "sync" ? job.sessionId : null,
       onError: code => { this.lastFailure = code; this.renderStatus(); },
     });
     this.ready = this.initialize().catch(() => { this.lastFailure = "startup_degraded"; });
@@ -112,9 +117,16 @@ export class MemoryRuntime {
     if (!job || typeof job.sessionId !== "string" || job.sessionId.length > 256) return null;
     if (job.kind === "hook") return this.policy.filterHook(job.payload) ? job : null;
     if (job.kind !== "sync" || !Array.isArray(job.source?.entries) || !Array.isArray(job.source?.branch)) return null;
-    const entries = job.source.entries.map(entry => this.policy.filterEntry(entry) ?? this.placeholder(entry));
-    const byId = new Map(entries.map(entry => [entry.id, entry]));
-    const branch = job.source.branch.map(entry => byId.get(entry.id) ?? this.placeholder(entry));
+    const entries = job.source.entries.map(entry => {
+      const filtered = this.policy.filterEntry(entry, job.sessionId);
+      if (job.sessionId === this.sessionId && typeof entry.id === "string" && !this.countedEntries.has(entry.id)) {
+        this.capturedChars += this.policy.entryChars(entry, job.sessionId);
+        this.countedEntries.add(entry.id);
+      }
+      return filtered ?? this.placeholder(entry);
+    });
+    // Also migrate pre-ID-list spools during replay.
+    const branch = job.source.branch.map((entry: any) => typeof entry === "string" ? entry : entry.id);
     // System prompts/tool schemas belong to the model, not the durable capture payload.
     return { ...job, source: { entries, branch, leafId: job.source.leafId }, taskModel: null };
   }
@@ -132,8 +144,9 @@ export class MemoryRuntime {
       if (manager.getSessionId && manager.getSessionId() !== this.sessionId) return;
       const leafId = manager.getLeafId?.() ?? null;
       if (!immediate && leafId === this.lastQueuedLeaf) return;
-      const entries = structuredClone(manager.getEntries?.() ?? manager.getBranch?.() ?? []);
-      const branch = structuredClone(manager.getBranch?.() ?? []);
+      // Harness entries are immutable; enqueue serializes this snapshot before returning.
+      const entries = manager.getEntries?.() ?? manager.getBranch?.() ?? [];
+      const branch = (manager.getBranch?.() ?? []).map((entry: any) => entry.id);
       if (this.queue.enqueue({kind: "sync", sessionId: this.sessionId, source: {entries, branch, leafId}, taskModel}, {immediate})) this.lastQueuedLeaf = leafId;
     } catch { this.lastFailure = "snapshot_failed"; }
     this.renderStatus();
@@ -146,7 +159,7 @@ export class MemoryRuntime {
       client.bindUser(this.sharedClient.authenticatedUser);
       if (this.config.sessionScopedMemory) client.bindScope(deriveSessionScope(job.sessionId, this.route));
     }
-    const sync = current ? this.sync : new this.dependencies.Sync(client, {stateDir: this.config.stateDir, namespaceKey: this.route.scopeKey, observation: this.observation, filterEntry: entry => this.policy.filterEntry(entry)});
+    const sync = current ? this.sync : new this.dependencies.Sync(client, {stateDir: this.config.stateDir, namespaceKey: this.route.scopeKey, observation: this.observation, filterEntry: entry => this.policy.filterEntry(entry, job.sessionId)});
     const abort = () => { if (!current) void client.close(true); };
     signal.addEventListener("abort", abort, {once: true});
     try {
@@ -158,14 +171,15 @@ export class MemoryRuntime {
       }
       await sync.ensureSession(job.sessionId);
       if (job.kind === "sync") {
-        const result = await sync.syncBranch(sourceView(job.source), current ? this.taskModel : null, signal);
+        const source = sourceView(job.source);
+        const result = await sync.syncBranch(source, current ? this.taskModel : null, signal);
         if (!result.allDelivered) throw new Error("sync_pending");
         if (!sync.sessionId || signal.aborted) throw new Error("native_mirror_pending");
         if (!await client.createSession(sync.sessionId)) throw new Error("native_session_unavailable");
         const mirror = current
           ? (this.mirror ??= new SessionMirror(client, this.config.stateDir, sync.sessionId))
           : new SessionMirror(client, this.config.stateDir, sync.sessionId);
-        if (!await mirror.sync(job.source.branch, signal)) {
+        if (!await mirror.sync(source.getBranch(), signal)) {
           this.lastFailure = mirror.status.lastError;
           throw new Error("native_mirror_pending");
         }
@@ -198,11 +212,9 @@ export class MemoryRuntime {
     return this.commitInFlight;
   }
 
-  maybeCommit(ctx = this.context): void {
-    const entries = ctx.sessionManager?.getBranch?.() ?? [];
-    const chars = JSON.stringify(entries).length;
-    if (chars - this.committedChars >= this.config.commitTokenThreshold * 4) {
-      this.committedChars = chars;
+  maybeCommit(): void {
+    if (this.capturedChars - this.committedChars >= this.config.commitTokenThreshold * 4) {
+      this.committedChars = this.capturedChars;
       void this.commit().catch(() => { this.lastFailure = "commit_failed"; });
     }
   }
@@ -210,7 +222,7 @@ export class MemoryRuntime {
   async saveHandoff(ctx = this.context): Promise<boolean> {
     if (!this.config.handoff.enabled || this.config.captureMode === "off") return false;
     if (ctx.sessionManager?.getSessionId && ctx.sessionManager.getSessionId() !== this.sessionId) return false;
-    const entries = (ctx.sessionManager?.getBranch?.() ?? []).map((entry: any) => this.policy.filterEntry(entry)).filter(Boolean);
+    const entries = (ctx.sessionManager?.getBranch?.() ?? []).map((entry: any) => this.policy.filterEntry(entry, this.sessionId)).filter(Boolean);
     const recent = entries.filter((entry: any) => ["user", "assistant"].includes(entry.message?.role)).slice(-6);
     const content = recent.map((entry: any) => `${entry.message.role}: ${textFromContext(entry.message)}`).filter((line: string) => !line.endsWith(": ")).join("\n\n").slice(-16000);
     if (!content || !this.policy.allows({content})) return false;
@@ -219,7 +231,7 @@ export class MemoryRuntime {
 
   renderStatus(): void {
     if (this.closed) return;
-    try { this.context.ui?.setStatus?.("openviking", `OV ${this.client.connected ? "✓" : "offline"} · pending ${this.queue.status.pending}`); } catch { /* optional UI */ }
+    try { this.context.ui?.setStatus?.("openviking", `OV ${this.client.connected ? "✓" : "offline"} · pending ${this.queue.status.pending} · dropped ${this.queue.status.dropped}`); } catch { /* optional UI */ }
   }
 
   async shutdown(ctx = this.context): Promise<void> {
@@ -227,10 +239,10 @@ export class MemoryRuntime {
     this.scheduleSync(ctx, null, true);
     this.postHook("session-end", {event: "session-end"});
     // A single overall deadline bounds drain, optional handoff and commit together.
-    await within(Promise.all([this.commit(), this.saveHandoff(ctx), this.ledger.flush()]).then(() => undefined), 1800, undefined);
+    await within(Promise.all([this.commit(), this.saveHandoff(ctx), this.ledger.flush()]).then(() => undefined), 1400, undefined);
     this.closed = true;
     this.recall.invalidate();
-    await within(Promise.all([this.queue.dispose(0), this.sync.stopBackground(), this.client.close(true), this.sharedClient.close(true)]).then(() => undefined), 100, undefined);
+    await within(Promise.all([this.queue.dispose(450), this.sync.stopBackground(), this.client.close(true), this.sharedClient.close(true)]).then(() => undefined), 500, undefined);
     try { this.context.ui?.setStatus?.("openviking", undefined); } catch { /* optional UI */ }
     this.observation.release();
   }

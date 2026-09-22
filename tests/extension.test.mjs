@@ -18,7 +18,24 @@ test('native session resume includes archive overview and text message parts',()
   assert.equal(textFromContext({content:[{type:'text',text:'OMP turn'}]}),'OMP turn');
 });
 
-async function fixture(t) {
+test('sync spool stores one tree and ordered branch IDs instead of duplicate entries', async t => {
+  const f = await fixture(t);
+  f.entries.push(...Array.from({length: 20}, (_, i) => ({id: `entry-${i}`, parentId: i ? `entry-${i-1}` : null,
+    type: 'message', message: {role: 'user', content: 'ordinary content '.repeat(3000)}})));
+  f.handlers.get('session_start')({}, f.ctx);
+  await f.handlers.get('session_shutdown')({}, f.ctx);
+  const files = await readdir(f.config.stateDir, {recursive: true});
+  const records = await Promise.all(files.filter(file => file.includes('pending/') && file.endsWith('.json'))
+    .map(file => readFile(join(f.config.stateDir, file), 'utf8')));
+  const snapshots = records.filter(text => JSON.parse(text).payload?.kind === 'sync');
+  assert.ok(snapshots.length);
+  for (const text of snapshots) {
+    assert.ok(Buffer.byteLength(text) < Buffer.byteLength(JSON.stringify(f.entries)) * 1.1);
+    assert.deepEqual(JSON.parse(text).payload.source.branch, f.entries.map(entry => entry.id));
+  }
+});
+
+async function fixture(t, Sync = SyncManager) {
   const home=await mkdtemp(join(tmpdir(),'ov-extension-'));
   const calls=[];
   class OfflineClient extends OVClient {
@@ -30,7 +47,7 @@ async function fixture(t) {
   const api={on:(name,fn)=>handlers.set(name,fn),registerTool:tool=>tools.set(tool.name,tool),registerCommand:(name,command)=>commands.set(name,command),getAllTools:()=>[...tools.values()],getActiveTools:()=>[...tools.keys()]};
   const entries=[];let sessionId='session-a';const notices=[];
   const ctx={cwd:home,ui:{notify:m=>notices.push(m),setStatus:()=>{}},sessionManager:{getSessionId:()=>sessionId,getEntries:()=>entries,getBranch:()=>entries,getLeafId:()=>entries.at(-1)?.id??null,isPersisted:()=>false},getSystemPrompt:()=>'',model:{contextWindow:100000,maxTokens:1000}};
-  openviking(api,{config,dependencies:{Client:OfflineClient,Sync:SyncManager}});
+  openviking(api,{config,dependencies:{Client:OfflineClient,Sync}});
   t.after(async()=>{await handlers.get('session_shutdown')?.({},ctx);await rm(home,{recursive:true,force:true});});
   return {home,config,handlers,tools,commands,ctx,entries,calls,notices,setSession:id=>{sessionId=id;}};
 }
@@ -53,6 +70,11 @@ test('URI guard routes local tools and denied tool payload never reaches durable
     const result=f.handlers.get('tool_call')({toolName:name,input:{path:'viking://user/me/memories/x'}},f.ctx);
     assert.equal(result.block,true);assert.match(result.reason,/viking_read|viking_search/);
   }
+  for (const [name, target] of [['write', 'viking_write'], ['edit', 'viking_edit'], ['patch', 'viking_edit'], ['apply_patch', 'viking_edit'], ['multiedit', 'viking_edit'], ['multi_edit', 'viking_edit']]) {
+    const result = f.handlers.get('tool_call')({toolName: name, input: {path: 'viking://user/me/memories/x'}}, f.ctx);
+    assert.equal(result?.block, true, name);
+    assert.ok(result.reason.includes(target));
+  }
   f.handlers.get('tool_call')({toolName:'bash',toolCallId:'private',input:{command:'cat /repo/.env'}},f.ctx);
   f.handlers.get('tool_result')({toolName:'bash',toolCallId:'private',content:'unique-secret-body'},f.ctx);
   f.entries.push({id:'a',parentId:null,type:'message',timestamp:'2026-09-21T00:00:00Z',message:{role:'assistant',content:[{type:'toolCall',id:'private',name:'bash',arguments:{command:'cat /repo/.env'}}]}});
@@ -70,4 +92,27 @@ test('same extension instance isolates session switch without rebinding authenti
   assert.ok(f.calls.length>0);assert.ok(f.calls.every(c=>c.user==='real-user'));
   const roots=new Set(f.calls.map(c=>c.root));assert.ok(roots.size>=2);
   assert.ok([...roots].every(root=>root.startsWith('viking://user/real-user/omp-ov-memory/sessions/')));
+});
+
+test('real OMP before_agent_start refreshes the task model without dead event registrations', async t => {
+  const capacities = [];
+  const branches = [];
+  class RecordingSync extends SyncManager {
+    async syncBranch(source, taskModel) {
+      capacities.push(taskModel?.capacity?.contextWindow);
+      branches.push(source.getBranch().map(entry => [entry.id, entry.message.content]));
+      return {allDelivered: false};
+    }
+  }
+  const f = await fixture(t, RecordingSync);
+  f.entries.push(...['root', 'off-branch', 'active'].map((content, i) => ({id: String(i), parentId: i ? '0' : null, type: 'message', message: {role: 'user', content}})));
+  f.ctx.sessionManager.getBranch = () => [f.entries[0], f.entries[2]];
+  for (const name of ['session_info_changed', 'model_select', 'thinking_level_select']) assert.equal(f.handlers.has(name), false);
+  f.handlers.get('before_agent_start')({prompt: 'start'}, f.ctx);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  f.ctx.model = {contextWindow: 200000, maxTokens: 2000};
+  f.handlers.get('before_agent_start')({prompt: 'continue'}, f.ctx);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(capacities.at(-1), 200000);
+  assert.deepEqual(branches.at(-1), [['0', 'root'], ['2', 'active']], 'delivery reconstructs ordered branch objects from IDs');
 });

@@ -14,7 +14,9 @@ The default `stateDir` is `~/.openviking/omp-ov-memory`. Queue identity includes
 
 A successful `enqueue()` means the event passed capture filtering and asynchronous local persistence started. It is not a disk-durability acknowledgement. An abrupt process or machine failure before persistence completes may require recovery from OMP's original session JSONL. Pending files that have completed publication survive process restart. Complete temporary records left by a dead writer are recovered; malformed/incomplete temporaries are retained and reported rather than treated as delivered.
 
-Disk errors cannot be turned into successful remote delivery. Failed spool writes retain their filtered bytes in the live process for retry, and surface `spool_write_failed`. If the process exits while the disk remains unwritable, only already persisted jobs and the original OMP transcript remain recoverable. The queue never discards overflow to enforce its 100-record dispatch window; disk usage can grow during a long outage.
+Disk errors cannot be turned into successful remote delivery. Failed spool writes retain their filtered bytes in the live process for retry, and surface `spool_write_failed`. If the process exits while the disk remains unwritable, only already persisted jobs and the original OMP transcript remain recoverable.
+
+Sync snapshots store the tree once and the branch as ordered entry IDs. Consecutive snapshots of the same session coalesce before delivery; hooks and session changes are ordering barriers. Each flush enforces a 64 MiB / 7-day retention budget under the process lease: expired records are removed, then oldest syncs, then oldest hooks if still over the byte cap. An uncertain in-flight handler retains its lease, deferring cleanup until it settles. `/ov status` exposes the last measured `bytes` and the process-local `dropped` counter; the status bar also shows drops. Budget drops emit `spool_budget_drop` and require the original OMP transcript for recovery.
 
 ## Replay sequence
 
@@ -33,7 +35,7 @@ Changing endpoint, account, configured user, credential or workspace identity in
 
 The default per-handler timeout is 2 seconds. Timeout aborts the handler signal and ends the wait, while the durable record remains. An abort-ignoring handler retains its lease until it settles, so another consumer does not immediately overlap the uncertain operation. A late successful result removes the record; a late failure retains it.
 
-`drain(timeoutMs)` bounds the time a caller waits. `dispose(timeoutMs)` additionally stops accepting new records and cancels the normal flush timer. A bounded shutdown may finish with pending work. It does not mark that work delivered, force a hung external provider to stop, or prove that a timed-out request never reached its destination.
+`drain(timeoutMs)` bounds the time a caller waits. `dispose(timeoutMs)` stops accepting records, cancels the timer, aborts delivery and joins accepted disk writes and the in-flight flush/lease cleanup within the remaining budget. Runtime shutdown reserves 450 ms for queue disposal inside OMP's 2-second hook window. Abandoned lease temporaries are collected when their owner is dead; malformed fragments age out. A bounded shutdown may finish with pending work or an abort-ignoring handler. It does not mark that work delivered or prove that a timed-out request never reached its destination; late handlers cannot acknowledge records after disposal.
 
 Replay-safe raw-event writes use deterministic identities and byte reconciliation. Native text append and commit use the separate durable mirror guard described below. Explicit resource ingestion and other non-idempotent tool side effects still need their own outcome checks. Do not manually repeat an uncertain write just because the extension returned control.
 
@@ -99,6 +101,7 @@ Common queue error codes:
 | `capture_rejected` | Filter/serialization failed closed |
 | `spool_write_failed` | Local private persistence could not complete; live process retains retry bytes |
 | `spool_incomplete` | A dead writer left an invalid temporary record; retained for diagnosis |
+| `spool_budget_drop` | Retention removed an expired or over-budget record; inspect `dropped` |
 | `queue_busy` | Another live dispatcher owns the spool |
 | `delivery_failed` | Handler rejected; ordered replay stopped at that record |
 | `delivery_timeout` | Handler exceeded its deadline; outcome may still be uncertain |

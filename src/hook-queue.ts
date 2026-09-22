@@ -1,6 +1,6 @@
 // Copyright 2026 omp-ov-memory contributors. SPDX-License-Identifier: Apache-2.0
-// A disk-backed queue: the in-memory dispatch window is bounded; overflow remains
-// recoverable on disk. Delivery is at least once. Handlers must reconcile writes
+// A disk-backed queue with bounded retention. Delivery is at least once within
+// the retention budget. Handlers must reconcile writes
 // using stable identities; a timeout is never evidence that a write did not occur.
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -12,6 +12,8 @@ export const HOOK_QUEUE_MAX = 100;
 export const HOOK_FLUSH_INTERVAL_MS = 2000;
 export const HOOK_FLUSH_THRESHOLD = 20;
 export const HOOK_TIMEOUT_MS = 2000;
+export const HOOK_SPOOL_MAX_BYTES = 64 * 1024 * 1024;
+export const HOOK_SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 export const IMMEDIATE_HOOKS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
 
 export interface HookQueueOptions<T> {
@@ -21,6 +23,10 @@ export interface HookQueueOptions<T> {
   handler: (payload: T, signal: AbortSignal) => Promise<void>;
   /** Must run before bytes reach disk. Called again on replay under the current policy. */
   filter?: (payload: T) => T | null;
+  /** Consecutive snapshots with this key supersede each other; null is a barrier. */
+  coalesceKey?: (payload: T) => string | null;
+  maxBytes?: number;
+  maxAgeMs?: number;
   maxSize?: number;
   flushIntervalMs?: number;
   flushThreshold?: number;
@@ -38,6 +44,8 @@ export class HookQueue<T = Record<string, unknown>> {
   private readonly timeoutMs: number;
   private sequence = 0;
   private pending = 0;
+  private bytes = 0;
+  private dropped = 0;
   private closed = false;
   private lastError: string | null = null;
   private initialized: Promise<void> | null = null;
@@ -45,6 +53,7 @@ export class HookQueue<T = Record<string, unknown>> {
   private flushPromise: Promise<boolean> | null = null;
   private activeDelivery: Promise<void> | null = null;
   private activeAbort: AbortController | null = null;
+  private leaseCleanup: Promise<void> | null = null;
   private writes = new Set<Promise<void>>();
   private failedWrites = new Map<string, string>();
 
@@ -56,8 +65,8 @@ export class HookQueue<T = Record<string, unknown>> {
     this.pendingDirectory = join(options.stateDir, "pending", key);
   }
 
-  get status(): { pending: number; inFlight: boolean; closed: boolean; lastError: string | null } {
-    return { pending: this.pending, inFlight: this.activeDelivery !== null, closed: this.closed, lastError: this.lastError };
+  get status(): { pending: number; bytes: number; dropped: number; inFlight: boolean; closed: boolean; lastError: string | null } {
+    return { pending: this.pending, bytes: this.bytes, dropped: this.dropped, inFlight: this.activeDelivery !== null, closed: this.closed, lastError: this.lastError };
   }
 
   /** No server I/O is awaited by a hot hook. Local spooling starts immediately. */
@@ -177,6 +186,22 @@ export class HookQueue<T = Record<string, unknown>> {
   private async recoverInterruptedSpools(): Promise<number> {
     let incomplete = 0;
     for (const file of await readdir(this.pendingDirectory)) {
+      if (/^\.lease-[a-z0-9-]+\.tmp$/.test(file)) {
+        const path = join(this.pendingDirectory, file);
+        try {
+          const {pid} = JSON.parse(await this.readPrivate(path));
+          if (Number.isSafeInteger(pid) && pid > 0) {
+            try { process.kill(pid, 0); continue; }
+            catch (probe: any) { if (probe?.code !== "ESRCH") continue; }
+            await rm(path);
+          }
+        } catch {
+          // Old formats have no PID in the filename. Retain fresh incomplete
+          // leases, but collect abandoned fragments after the retention window.
+          if (Date.now() - (await lstat(path)).mtimeMs > (this.options.maxAgeMs ?? HOOK_SPOOL_MAX_AGE_MS)) await rm(path);
+        }
+        continue;
+      }
       const match = /^(\d+-\d+-[a-f0-9-]+\.json)\.(\d+)\.[a-z0-9-]+\.tmp$/.exec(file);
       if (!match) continue;
       try { process.kill(Number(match[2]), 0); continue; }
@@ -196,6 +221,7 @@ export class HookQueue<T = Record<string, unknown>> {
 
   flush(): Promise<boolean> {
     if (this.flushPromise) return this.flushPromise;
+    if (this.closed) return Promise.resolve(false);
     if (this.activeDelivery) return Promise.resolve(false);
     this.clearTimer();
     const run = this.flushNow().catch(() => { this.report("queue_io_failed"); return false; })
@@ -206,11 +232,48 @@ export class HookQueue<T = Record<string, unknown>> {
 
   async replayPending(): Promise<boolean> { return this.flush(); }
 
+  /** Called only while holding the delivery lease, so an uncertain delivery is retained. */
+  private async compactSpools(files: string[]): Promise<string[]> {
+    const removed = new Set<string>();
+    const records: {file: string; key: string | null; bytes: number}[] = [];
+    for (const file of files) {
+      const text = await this.readPrivate(join(this.pendingDirectory, file));
+      const record = JSON.parse(text) as Envelope<T>;
+      if (record.version !== 1 || `${record.id}.json` !== file || !("payload" in record)) throw new Error("invalid queue record");
+      const key = this.options.coalesceKey?.(record.payload) ?? null;
+      const previous = records.at(-1);
+      records.push({file, key, bytes: Buffer.byteLength(text)});
+      if (key !== null && key === previous?.key) {
+        await rm(join(this.pendingDirectory, previous.file));
+        removed.add(previous.file);
+      }
+    }
+    const retained = records.filter(record => !removed.has(record.file));
+    this.bytes = retained.reduce((total, record) => total + record.bytes, 0);
+    const drop = async (record: typeof retained[number]) => {
+      await rm(join(this.pendingDirectory, record.file));
+      removed.add(record.file);
+      this.bytes -= record.bytes;
+      this.dropped++;
+      this.report("spool_budget_drop");
+    };
+    const cutoff = Date.now() - (this.options.maxAgeMs ?? HOOK_SPOOL_MAX_AGE_MS);
+    for (const record of retained) if (Number(record.file.split("-")[0]) < cutoff) await drop(record);
+    // Prefer dropping reconstructible snapshots, then oldest hooks if hooks alone
+    // exceed the cap. Never discard an in-flight record: this runs under the lease.
+    for (const record of [...retained.filter(record => record.key !== null), ...retained.filter(record => record.key === null)]) {
+      if (this.bytes <= (this.options.maxBytes ?? HOOK_SPOOL_MAX_BYTES)) break;
+      if (!removed.has(record.file)) await drop(record);
+    }
+    return files.filter(file => !removed.has(file));
+  }
+
   private async flushNow(): Promise<boolean> {
     await this.initialize();
     for (const [id, serialized] of this.failedWrites) this.spool(id, serialized);
     // Include spools accepted while a previous disk write was still finishing.
     while (this.writes.size) await Promise.all([...this.writes]);
+    if (this.closed) return this.pending === 0 && this.failedWrites.size === 0;
     if (this.failedWrites.size) return false;
     const release = await this.acquireLease();
     if (!release) { this.report("queue_busy"); return false; }
@@ -219,13 +282,14 @@ export class HookQueue<T = Record<string, unknown>> {
       while (true) {
         while (this.writes.size) await Promise.all([...this.writes]);
         if (this.failedWrites.size) return false;
-        const files = (await readdir(this.pendingDirectory)).filter(file => /^\d+-\d+-[a-f0-9-]+\.json$/.test(file)).sort();
+        const files = await this.compactSpools((await readdir(this.pendingDirectory)).filter(file => /^\d+-\d+-[a-f0-9-]+\.json$/.test(file)).sort());
         // A new enqueue may have started while readdir was awaiting the kernel.
         // Do not report a successful drain before its spool has become visible.
         if (!files.length && this.writes.size > 0) continue;
         this.pending = files.length + incomplete;
         if (!files.length) { if (!incomplete) this.lastError = null; return incomplete === 0; }
         for (const file of files.slice(0, this.windowSize)) {
+          if (this.closed) return false;
           const path = join(this.pendingDirectory, file);
           const record = JSON.parse(await this.readPrivate(path)) as Envelope<T>;
           if (record.version !== 1 || `${record.id}.json` !== file || !("payload" in record)) throw new Error("invalid queue record");
@@ -236,6 +300,7 @@ export class HookQueue<T = Record<string, unknown>> {
           // A policy update can further redact a record before a new delivery attempt.
           const next = `${JSON.stringify({ ...record, payload })}\n`;
           if (next !== `${JSON.stringify(record)}\n`) await this.atomicWrite(path, next);
+          if (this.closed) return false;
           if (!await this.deliver(payload, path)) return false;
         }
       }
@@ -243,7 +308,7 @@ export class HookQueue<T = Record<string, unknown>> {
       if (this.activeDelivery) {
         // Keep the lease while an abort-ignoring handler is still uncertain. Its late
         // confirmed success may acknowledge the record; a late failure leaves it pending.
-        void this.activeDelivery.finally(release).catch(() => {});
+        this.leaseCleanup = this.activeDelivery.catch(() => {}).then(release).finally(() => { this.leaseCleanup = null; });
       } else await release();
     }
   }
@@ -252,7 +317,10 @@ export class HookQueue<T = Record<string, unknown>> {
     const controller = new AbortController();
     this.activeAbort = controller;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
     const delivery = Promise.resolve().then(() => this.options.handler(payload, controller.signal)).then(async () => {
+      // A handler ignoring abort must not start filesystem work after shutdown.
+      if (this.closed) return;
       await rm(path);
       this.pending = Math.max(0, this.pending - 1);
     });
@@ -263,11 +331,15 @@ export class HookQueue<T = Record<string, unknown>> {
     try {
       return await Promise.race([
         delivery.then(() => true, () => { this.report("delivery_failed"); return false; }),
+        new Promise<boolean>(resolve => {
+          onAbort = () => resolve(false);
+          controller.signal.addEventListener("abort", onAbort, {once: true});
+        }),
         new Promise<boolean>(resolve => { timer = setTimeout(() => {
           controller.abort(); this.report("delivery_timeout"); resolve(false);
         }, this.timeoutMs); }),
       ]);
-    } finally { if (timer) clearTimeout(timer); }
+    } finally { if (timer) clearTimeout(timer); if (onAbort) controller.signal.removeEventListener("abort", onAbort); }
   }
 
   async drain(timeoutMs = HOOK_TIMEOUT_MS): Promise<boolean> {
@@ -285,6 +357,18 @@ export class HookQueue<T = Record<string, unknown>> {
   async dispose(timeoutMs = HOOK_TIMEOUT_MS): Promise<boolean> {
     this.closed = true;
     this.clearTimer();
-    return this.drain(timeoutMs);
+    this.activeAbort?.abort();
+    // Do not start a fresh flush/lease during teardown. Join accepted durable
+    // writes and the existing flush within the caller's remaining hook budget.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        Promise.all([Promise.all([...this.writes]), this.flushPromise]).then(async () => {
+          await this.leaseCleanup;
+          return this.pending === 0 && this.failedWrites.size === 0;
+        }),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
   }
 }

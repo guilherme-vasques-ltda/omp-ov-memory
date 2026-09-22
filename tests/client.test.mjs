@@ -20,6 +20,16 @@ async function server(t, handler) {
 function send(res, status, result) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); }
 async function body(req) { let text = ''; for await (const chunk of req) text += chunk; return JSON.parse(text || '{}'); }
 
+test('remember requests extraction without archiving the shared live backlog', async t => {
+  const requests = [];
+  const client = await server(t, async (req, res) => {
+    requests.push({path: req.url, method: req.method, body: await body(req)});
+    send(res, 200, {status: 'ok', result: {}});
+  });
+  assert.equal(await client.commitRememberedMessage('shared/id'), true);
+  assert.deepEqual(requests, [{path: '/api/v1/sessions/shared%2Fid/extract', method: 'POST', body: {}}]);
+});
+
 test('live-shaped health, envelope, namespace, peer header and message body', async t => {
   const requests = [];
   const client = await server(t, async (req, res) => {

@@ -87,15 +87,72 @@ test('timeout bounds flush and avoids overlapping uncertain delivery', async t =
 
 test('shutdown drain budget bounds stalled handler while pending survives', async t => {
   let release;
-  const { create } = await fixture(t, { timeoutMs: 2000, handler: async () => { await new Promise(resolve => { release = resolve; }); } });
+  let onStart;
+  const waiting = new Promise(resolve => { onStart = resolve; });
+  const { create } = await fixture(t, { timeoutMs: 2000, handler: async () => { onStart(); await new Promise(resolve => { release = resolve; }); } });
   const queue = create();
   queue.enqueue({ index: 1 });
+  void queue.flush();
+  await waiting;
   const started = performance.now();
   assert.equal(await queue.dispose(25), false);
   assert.ok(performance.now() - started < 400);
   assert.equal(queue.enqueue({ index: 2 }), false);
   assert.equal(queue.status.pending, 1);
+  const competing = create({handler: async () => assert.fail('uncertain handler must retain its lease')});
+  assert.equal(await competing.flush(), false);
   release();
+});
+
+test('dispose quiesces accepted disk writes and leaves no lease temporaries', async t => {
+  const { create } = await fixture(t, {handler: async () => { throw new Error('offline'); }});
+  const queue = create();
+  for (let i = 0; i < 20; i++) queue.enqueue({index: i, text: 'x'.repeat(50_000)}, {immediate: true});
+  await queue.dispose(400);
+  const files = await readdir(queue.pendingDirectory);
+  assert.equal(files.filter(file => file.endsWith('.json')).length, 20);
+  assert.equal(files.some(file => file.endsWith('.tmp') || file === '.lease'), false);
+  await rm(queue.pendingDirectory, {recursive: true});
+  await new Promise(resolve => setTimeout(resolve, 30));
+  await assert.rejects(readdir(queue.pendingDirectory), {code: 'ENOENT'}, 'no writes may recreate the spool after dispose');
+});
+
+test('dispose aborts and joins an in-flight flush before returning', async t => {
+  let onStart;
+  const started = new Promise(resolve => { onStart = resolve; });
+  const { create } = await fixture(t, {handler: async (_, signal) => {
+    onStart();
+    await new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), {once: true}));
+  }});
+  const queue = create();
+  queue.enqueue({index: 1}, {immediate: true});
+  await started;
+  await queue.dispose(400);
+  assert.deepEqual((await readdir(queue.pendingDirectory)).map(file => file.endsWith('.json')), [true]);
+});
+
+test('a late replay cannot initialize disk state after disposal', async t => {
+  const {create} = await fixture(t);
+  const queue = create();
+  await queue.dispose(400);
+  assert.equal(await queue.replayPending(), false);
+  await assert.rejects(readdir(queue.pendingDirectory), {code: 'ENOENT'});
+});
+
+test('replay collects abandoned lease temporaries while preserving live owners', async t => {
+  const { create } = await fixture(t);
+  const queue = create();
+  await queue.replayPending();
+  const { writeFile, utimes } = await import('node:fs/promises');
+  await writeFile(join(queue.pendingDirectory, '.lease-dead.tmp'), JSON.stringify({pid: 2147483647}));
+  await writeFile(join(queue.pendingDirectory, '.lease-live.tmp'), JSON.stringify({pid: process.pid}));
+  const fragment = join(queue.pendingDirectory, '.lease-fragment.tmp');
+  await writeFile(fragment, '{');
+  await utimes(fragment, new Date(0), new Date(0));
+  await queue.replayPending();
+  assert.equal((await readdir(queue.pendingDirectory)).includes('.lease-dead.tmp'), false);
+  assert.equal((await readdir(queue.pendingDirectory)).includes('.lease-live.tmp'), true);
+  assert.equal((await readdir(queue.pendingDirectory)).includes('.lease-fragment.tmp'), false);
 });
 
 test('immediate lifecycle events and threshold start non-awaited delivery', async t => {
@@ -114,7 +171,7 @@ test('replay recovers a complete atomic spool temporary left by a dead process',
   const { create } = await fixture(t, { handler: async value => { delivered.push(value.text); } });
   const queue = create();
   await queue.replayPending();
-  const id = '0001750000000000-0000000001-01234567-1234-4321-9876-123456789abc';
+  const id = `${String(Date.now()).padStart(16, '0')}-0000000001-01234567-1234-4321-9876-123456789abc`;
   const { writeFile } = await import('node:fs/promises');
   await writeFile(join(queue.pendingDirectory, `${id}.json.2147483647.recovery.tmp`), JSON.stringify({ version: 1, id, payload: { text: 'recover me' } }), { mode: 0o600 });
   assert.equal(await queue.replayPending(), true);
@@ -136,4 +193,47 @@ test('two queue instances sharing an identity never dispatch a record concurrent
   release();
   assert.equal(await drain, true);
   assert.deepEqual(delivered, [1]);
+});
+
+const syncKey = payload => payload.kind === 'sync' ? payload.sessionId : null;
+async function pendingRecords(queue) {
+  const files = (await readdir(queue.pendingDirectory)).filter(file => file.endsWith('.json')).sort();
+  return Promise.all(files.map(async file => JSON.parse(await readFile(join(queue.pendingDirectory, file), 'utf8')).payload));
+}
+
+test('consecutive sync snapshots coalesce per session without crossing hook or session boundaries', async t => {
+  const { create } = await fixture(t, { coalesceKey: syncKey, handler: async () => { throw new Error('offline'); } });
+  const queue = create();
+  const records = [
+    {kind: 'sync', sessionId: 'a', revision: 1}, {kind: 'sync', sessionId: 'a', revision: 2},
+    {kind: 'hook', sessionId: 'a'}, {kind: 'sync', sessionId: 'a', revision: 3},
+    {kind: 'sync', sessionId: 'b', revision: 1}, {kind: 'sync', sessionId: 'b', revision: 2},
+  ];
+  for (const record of records) queue.enqueue(record);
+  await queue.flush();
+  assert.deepEqual(await pendingRecords(queue), [records[1], records[2], records[3], records[5]]);
+  assert.equal(queue.status.pending, 4);
+});
+
+test('byte and age budgets drop oldest syncs with an observable counter during an outage', async t => {
+  const errors = [];
+  const { create } = await fixture(t, {coalesceKey: syncKey, maxBytes: 1500, maxAgeMs: 60_000,
+    onError: code => errors.push(code), handler: async () => { throw new Error('offline'); }});
+  const queue = create();
+  queue.enqueue({kind: 'sync', sessionId: 'old', text: 'a'.repeat(800)});
+  queue.enqueue({kind: 'hook', event: 'barrier'});
+  queue.enqueue({kind: 'sync', sessionId: 'new', text: 'b'.repeat(800)});
+  await queue.flush();
+  assert.deepEqual((await pendingRecords(queue)).map(record => record.sessionId ?? record.event), ['barrier', 'new']);
+  assert.equal(queue.status.dropped, 1);
+  assert.ok(queue.status.bytes <= 1500);
+  assert.ok(errors.includes('spool_budget_drop'));
+  await queue.dispose(50);
+  const { writeFile } = await import('node:fs/promises');
+  const id = '0001750000000000-0000000001-01234567-1234-4321-9876-123456789abc';
+  await writeFile(join(queue.pendingDirectory, `${id}.json`), JSON.stringify({version: 1, id, payload: {kind: 'sync', sessionId: 'expired'}}));
+  const restarted = create();
+  await restarted.replayPending();
+  assert.equal(restarted.status.dropped, 1);
+  assert.equal((await pendingRecords(restarted)).some(record => record.sessionId === 'expired'), false);
 });

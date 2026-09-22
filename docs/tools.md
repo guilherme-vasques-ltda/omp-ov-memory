@@ -82,7 +82,7 @@ Only public HTTP(S) text sources are accepted. Localhost, private and reserved a
 
 Downloads are bounded to 2 MiB and 15 seconds across DNS and redirects. The bytes must decode as UTF-8. Only text, JSON and XML content types are accepted. HTML remains literal text: the upload uses a `.txt` filename and `text/plain`, so ingestion cannot initiate embedded media or link fetches. The final source URL's query and fragment are removed before creating source metadata. The OV server receives a temporary upload ID, never a remote fetch URL.
 
-Scoped resources target `<session-root>/resources/imported-<uuid>`; shared resources target `viking://resources/imported-<uuid>`. Native temporary upload plus an explicit target under the authenticated user's `resources` path was verified against v0.4.20. Ingestion may continue asynchronously after the tool returns. Check server state before retrying a failed or timed-out write; the plugin never automatically retries writes.
+Scoped resources target `<session-root>/resources/imported-<uuid>`; shared resources target `viking://resources/imported-<uuid>`. Live v0.4.20 rejects the scoped target with `INVALID_URI`; the multipart smoke therefore exercises shared-mode ingestion in the canonical resources namespace and cleans up its disposable target. Scoped `viking_remember` content writes are separately tested with a search round trip. Ingestion may continue asynchronously after the tool returns. Check server state before retrying a failed or timed-out write; the plugin never automatically retries writes.
 
 ## Edit and archive limits
 

@@ -2,7 +2,7 @@ import { Type, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { createHash, randomUUID } from "node:crypto";
 import { canonicalVikingUri as parseVikingUri, insideVikingRoot, isManagedVikingUri, downloadPublicText } from "./security.ts";
-const StringEnum = (values: readonly string[]) => Type.Union(values.map(value => Type.Literal(value)));
+const StringEnum = (values: readonly string[], options = {}) => Type.Union(values.map(value => Type.Literal(value)), options);
 import type { OVClient } from "./client.ts";
 import type { SyncManager } from "./sync.ts";
 import { observation, type Observation } from "./shared/observe.mjs";
@@ -103,8 +103,8 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
     const execute = tool.execute;
     (tool.parameters as any).additionalProperties = false;
     api.registerTool({ ...tool, async execute(id: string, params: any, signal?: AbortSignal, onUpdate?: any, ctx?: any) {
-      // Pi calls this before host validation; direct/MCP callers need the same
-      // idempotent normalization before our independent validation boundary.
+      // OMP validates the schema before execute and has no prepareArguments hook.
+      // Positional/bare-string recovery is for direct/MCP callers at this boundary.
       if (tool.prepareArguments) params = tool.prepareArguments(params);
       if (!Value.Check(tool.parameters, params)) return failure("Invalid tool arguments; follow the tool's input schema.");
       if (signal?.aborted) return failure("Tool call cancelled.");
@@ -149,13 +149,13 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
     };
   };
 
-  /** Deletion is additionally forbidden for adapter-owned immutable facts. */
-  const authorizeDelete = (input: unknown, tool: string, root = scoped()): { uri: string | null; error: string | null } => {
+  /** Mutations are additionally forbidden for adapter-owned immutable facts. */
+  const authorizeMutation = (input: unknown, tool: string, operation: "delete" | "write", root = scoped()): { uri: string | null; error: string | null } => {
     const raw = String(input ?? "");
     const uri = canonicalVikingUri(raw);
     const internal = Boolean(uri && (isManagedVikingUri(uri) || uri === root || uri === "viking://"));
     const allowed = uri !== null && insideCanonical(uri, root) && !internal;
-    observe.emit("tool_scope", tool, "delete", Boolean(root), allowed ? "allow" : "deny", allowed ? 1 : 0, allowed ? 0 : 1);
+    observe.emit("tool_scope", tool, operation, Boolean(root), allowed ? "allow" : "deny", allowed ? 1 : 0, allowed ? 0 : 1);
     if (allowed) return { uri, error: null };
     if (!uri) return { uri: null, error: `Refused: ${raw} is not a valid viking URI.` };
     return {
@@ -261,7 +261,7 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
     prepareArguments: args => withArgumentDefaults(typeof args === "string" ? { uri: args } : args, { level: "abstract" }),
     parameters: Type.Object({
       uri: Type.String({ description: "viking:// URI to read" }),
-      level: Type.Optional({ ...StringEnum(["abstract", "overview", "full"] as const), default: "abstract", description: "Detail level (default: abstract)" }),
+      level: Type.Optional(StringEnum(["abstract", "overview", "full"], { default: "abstract", description: "Detail level (default: abstract)" })),
     }),
     async execute(
       _id: string, params: any, _signal?: AbortSignal,
@@ -300,7 +300,7 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
     ],
     prepareArguments: prepareBrowseArguments,
     parameters: Type.Object({
-      action: Type.Optional({ ...StringEnum(["list", "stat", "tree"] as const), default: "list", description: "Directory operation (default: list); use viking_tree for custom tree depth/limit" }),
+      action: Type.Optional(StringEnum(["list", "stat", "tree"], { default: "list", description: "Directory operation (default: list); use viking_tree for custom tree depth/limit" })),
       uri: Type.Optional(Type.String({ default: "viking://", description: "viking:// URI; defaults to the active root" })),
     }),
     async execute(
@@ -337,7 +337,7 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
   pi.registerTool({
     name: "viking_remember",
     label: "Viking Remember",
-    description: "Store a fact or memory in OpenViking. Scoped mode saves a create-only content-addressed note inside this session namespace. Unscoped mode stores a session message and requests extraction on commit. Use for important information the agent should remember: preferences, decisions, gotchas, lessons learned.",
+    description: "Store a fact or memory in OpenViking. Scoped mode saves a create-only content-addressed note inside this session namespace. Unscoped mode stores a session message and requests session-wide extraction without archiving live turns. Use for important information the agent should remember: preferences, decisions, gotchas, lessons learned.",
     promptSnippet: "Store a durable fact in the active OpenViking memory namespace",
     promptGuidelines: [
       "Use viking_remember for facts that should survive context resets and session resumes but don't belong in MEMORY.md.",
@@ -405,7 +405,7 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
       if (Boolean(params.uri) === Boolean(params.query)) return failure("Provide exactly one of 'uri' or 'query'.");
       if (params.uri) {
         const root = scoped();
-        const deletion = authorizeDelete(params.uri, "viking_forget", root);
+        const deletion = authorizeMutation(params.uri, "viking_forget", "delete", root);
         if (deletion.error) return failure(deletion.error);
         const uri = deletion.uri!;
         const ok = await client.delete(uri);
@@ -421,7 +421,7 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
         const searchScope = resolveSearchScope("viking_forget", undefined, root);
         const results = await client.find(params.query, { targetUri: searchScope.targetUri, topK: 1 });
         if (results.length > 0 && results[0].score > 0.8) {
-          const deletion = authorizeDelete(results[0].uri, "viking_forget", root);
+          const deletion = authorizeMutation(results[0].uri, "viking_forget", "delete", root);
           if (deletion.error) return failure(deletion.error);
           const uri = deletion.uri!;
           if (_signal?.aborted) return failure("Tool call cancelled.");
@@ -595,7 +595,7 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
     }),
     async execute(_id: string, params: any, signal?: AbortSignal) {
       if (unavailable("viking_write")) return failure("OpenViking server is not reachable.");
-      const access = authorizeDelete(params.uri, "viking_write");
+      const access = authorizeMutation(params.uri, "viking_write", "write");
       if (access.error) return failure(access.error);
       const directory = access.uri!.slice(0, access.uri!.lastIndexOf("/"));
       const base = /^viking:\/\/user\/[^/]+/.exec(access.uri!)?.[0] ?? /^viking:\/\/[^/]+/.exec(access.uri!)![0];
@@ -615,7 +615,7 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
     }),
     async execute(_id: string, params: any, signal?: AbortSignal) {
       if (unavailable("viking_edit")) return failure("OpenViking server is not reachable.");
-      const access = authorizeDelete(params.uri, "viking_edit");
+      const access = authorizeMutation(params.uri, "viking_edit", "write");
       if (access.error) return failure(access.error);
       const uri = access.uri!;
       const previous = editLocks.get(uri) ?? Promise.resolve();

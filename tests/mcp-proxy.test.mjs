@@ -39,7 +39,7 @@ async function harness(t, { sessionScopedMemory = true } = {}) {
     }
     if (url.pathname === '/api/v1/content/write') { content.set(parsed.uri, parsed.content); ok({ uri: parsed.uri }); return; }
     if (url.pathname === '/api/v1/search/find') { ok({ memories: [], resources: [], skills: [] }); return; }
-    if (url.pathname === '/api/v1/sessions' || /\/sessions\/[^/]+\/(messages|commit)$/.test(url.pathname)) { ok({}); return; }
+    if (url.pathname === '/api/v1/sessions' || /\/sessions\/[^/]+\/(messages|extract)$/.test(url.pathname)) { ok({}); return; }
     res.statusCode = 404; res.end(JSON.stringify({ status: 'error' }));
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -158,6 +158,7 @@ test('MCP explicit session IDs stay separated by workspace even with shared memo
   assert.notEqual(nativeId(first), nativeId(second));
   for (const h of [first, second]) {
     assert.ok(h.requests.some(request => request.url.pathname === `/api/v1/sessions/${nativeId(h)}/messages`));
-    assert.ok(h.requests.some(request => request.url.pathname === `/api/v1/sessions/${nativeId(h)}/commit`));
+    assert.ok(h.requests.some(request => request.url.pathname === `/api/v1/sessions/${nativeId(h)}/extract`));
+    assert.equal(h.requests.some(request => request.body?.keep_recent_count === 0), false);
   }
 });

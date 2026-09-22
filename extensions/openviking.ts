@@ -99,7 +99,10 @@ export default function openviking(pi: MemoryExtensionAPI, options: ExtensionOpt
     // All startup I/O continues in the background; OMP stays interactive.
   });
 
-  guarded("before_agent_start", (event, _ctx, runtime) => {
+  guarded("before_agent_start", (event, ctx, runtime) => {
+    // OMP has no model/thinking selection events. Refresh current model facts
+    // at this real lifecycle boundary, including when the leaf has not changed.
+    runtime.scheduleSync(ctx, taskModel(ctx), true);
     runtime.recall.queueSearch(String(event.prompt ?? ""));
     runtime.postHook("user-prompt", {prompt: String(event.prompt ?? "")});
     if (runtime.handoffBlock) {
@@ -134,20 +137,22 @@ export default function openviking(pi: MemoryExtensionAPI, options: ExtensionOpt
   guarded("tool_call", (event, _ctx, runtime) => {
     runtime.postHook("tool-call", event);
     const name = String(event.toolName ?? "").toLowerCase();
-    if (!["read", "bash", "glob", "grep", "find", "ls"].includes(name)) return;
+    if (!["read", "bash", "glob", "grep", "find", "ls", "write", "edit", "patch", "apply_patch", "multiedit", "multi_edit"].includes(name)) return;
     const uri = findVikingUri(event.input ?? event.args ?? {});
     if (!uri) return;
-    const tool = ["grep", "glob", "find"].includes(name) ? "viking_search" : "viking_read";
+    const tool = name === "write" ? "viking_write"
+      : ["edit", "patch", "apply_patch", "multiedit", "multi_edit"].includes(name) ? "viking_edit"
+      : ["grep", "glob", "find"].includes(name) ? "viking_search" : "viking_read";
     // The Extension API cannot change the tool name; block local execution and route the model.
     return {block: true, reason: `This is an OpenViking virtual URI. Use ${tool} for ${uri}; do not pass viking:// to local filesystem or shell tools.`};
   });
   guarded("tool_result", (event, _ctx, runtime) => { runtime.postHook("tool-result", event); });
-  for (const event of ["turn_end", "agent_end", "session_tree", "session_info_changed", "model_select", "thinking_level_select"]) {
+  for (const event of ["turn_end", "agent_end", "session_tree"]) {
     guarded(event, (_payload, ctx, runtime) => {
       runtime.scheduleSync(ctx, taskModel(ctx), event === "agent_end");
       if (event === "agent_end") {
         runtime.postHook("stop", {event: "stop"});
-        runtime.maybeCommit(ctx);
+        runtime.maybeCommit();
         void within(runtime.saveHandoff(ctx), 1900, false);
         runtime.recall.invalidate();
       }
