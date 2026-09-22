@@ -1,6 +1,6 @@
 {
   "name": "omp-ov-memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Durable OpenViking memory, recall and cross-agent handoff for OMP and Pi",
   "type": "module",
   "license": "Apache-2.0",

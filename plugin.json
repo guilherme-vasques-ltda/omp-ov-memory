@@ -1,6 +1,6 @@
 {
   "name": "omp-ov-memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenViking durable memory and handoff for OMP",
   "license": "Apache-2.0",
   "author": {
