@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { Value } from 'typebox/value';
 import { createTools, VIKING_TOOL_NAMES } from '../src/tools.ts';
 import { canonicalVikingUri, isPublicAddress, validatePublicUrl, downloadPublicText } from '../src/security.ts';
 
@@ -14,6 +15,8 @@ function fixture(overrides = {}, sync = null) {
     delete: async (...args) => { calls.push(['delete', ...args]); return true; },
     health: async () => true,
     tree: async (...args) => { calls.push(['tree', ...args]); return { ok: true, result: { entries: [] } }; },
+    ls: async (...args) => { calls.push(['ls', ...args]); return []; },
+    stat: async (...args) => { calls.push(['stat', ...args]); return { isDir: true }; },
     ...overrides,
   };
   const tools = new Map(createTools(client, sync, { emit() {} }).map(tool => [tool.name, tool]));
@@ -25,6 +28,161 @@ test('registers exactly eleven shared tools with JSON schemas', () => {
   assert.equal(tools.size, 11);
   assert.deepEqual([...tools.keys()], [...VIKING_TOOL_NAMES]);
   for (const tool of tools.values()) assert.equal(tool.parameters.additionalProperties, false);
+});
+
+test('browse defaults to listing the active root through direct and prepared calls', async () => {
+  for (const sessionScopedMemory of [true, false]) {
+    const { tools, call, calls } = fixture({ cfg: { sessionScopedMemory, recallMaxContentChars: 1000 } });
+    const browse = tools.get('viking_browse');
+    const root = sessionScopedMemory ? 'viking://user/alice' : 'viking://';
+    assert.equal((await call('viking_browse')).isError, undefined);
+    assert.deepEqual(calls, [['ls', root]]);
+    assert.equal(browse.parameters.properties.action.default, 'list');
+    assert.equal(browse.parameters.properties.uri.default, 'viking://');
+    assert.ok(Value.Check(browse.parameters, {}));
+    const prepared = browse.prepareArguments({});
+    assert.deepEqual(prepared, { action: 'list', uri: 'viking://' });
+    assert.ok(Value.Check(browse.parameters, prepared));
+    assert.deepEqual(browse.prepareArguments(prepared), prepared);
+    assert.equal((await call('viking_browse', prepared)).isError, undefined);
+    assert.deepEqual(calls[1], ['ls', root]);
+  }
+});
+
+test('browse normalizes bare actions, bare URIs and unambiguous positional fields before validation', async () => {
+  const uri = 'viking://user/alice/memories';
+  for (const [input, expected, operation] of [
+    ['list', { action: 'list', uri: 'viking://' }, 'ls'],
+    ['stat', { action: 'stat', uri: 'viking://' }, 'stat'],
+    [uri, { action: 'list', uri }, 'ls'],
+    [{ 0: 'stat', 1: uri }, { action: 'stat', uri }, 'stat'],
+    [{ 0: 'list', uri }, { action: 'list', uri }, 'ls'],
+  ]) {
+    const { tools, call, calls } = fixture();
+    const browse = tools.get('viking_browse');
+    const original = structuredClone(input);
+    const prepared = browse.prepareArguments(input);
+    assert.deepEqual(prepared, expected);
+    assert.ok(Value.Check(browse.parameters, prepared));
+    assert.deepEqual(browse.prepareArguments(prepared), prepared);
+    assert.deepEqual(input, original, 'normalization must not mutate the caller input');
+    assert.equal((await call('viking_browse', input)).isError, undefined);
+    assert.equal((await call('viking_browse', prepared)).isError, undefined);
+    const target = expected.uri === 'viking://' ? 'viking://user/alice' : expected.uri;
+    assert.deepEqual(calls, [[operation, target], [operation, target]]);
+  }
+});
+
+test('browse preserves invalid values, unknown fields and conflicting positional arguments for rejection', async () => {
+  const { tools, call, calls } = fixture();
+  const browse = tools.get('viking_browse');
+  for (const args of [
+    'delete', '', null, 3, [], ['list'],
+    { action: 'delete' }, { action: '' }, { action: null }, { action: 1 },
+    { uri: null }, { uri: 1 }, { unexpected: true },
+    { action: 'stat', 0: 'list' }, { uri: 'viking://', 1: 'viking://user/alice' },
+    { 0: 'list', 2: 'extra' },
+  ]) {
+    assert.equal(Value.Check(browse.parameters, browse.prepareArguments(args)), false, JSON.stringify(args));
+    const result = await call('viking_browse', args);
+    assert.equal(result.isError, true, JSON.stringify(args));
+    assert.match(result.content[0].text, /Invalid tool arguments/);
+  }
+  for (const uri of ['viking://user/bob', 'viking://user/alice/../bob', '']) {
+    assert.equal((await call('viking_browse', { uri })).isError, true);
+  }
+  assert.deepEqual(calls, []);
+});
+
+test('tree supplies root and bounded defaults and accepts a bare URI before validation', async () => {
+  for (const sessionScopedMemory of [true, false]) {
+    const { tools, call, calls } = fixture({ cfg: { sessionScopedMemory, recallMaxContentChars: 1000 } });
+    const tree = tools.get('viking_tree');
+    const root = sessionScopedMemory ? 'viking://user/alice' : 'viking://';
+    assert.equal(tree.parameters.properties.uri.default, 'viking://');
+    assert.ok(Value.Check(tree.parameters, {}));
+    for (const [input, expected] of [
+      [{}, { uri: 'viking://', depth: 3, limit: 100 }],
+      [undefined, { uri: 'viking://', depth: 3, limit: 100 }],
+      ['viking://user/alice/memories', { uri: 'viking://user/alice/memories', depth: 3, limit: 100 }],
+      [{ depth: 2, limit: 20 }, { uri: 'viking://', depth: 2, limit: 20 }],
+    ]) {
+      const prepared = tree.prepareArguments(input);
+      assert.deepEqual(prepared, expected);
+      assert.ok(Value.Check(tree.parameters, prepared));
+      assert.deepEqual(tree.prepareArguments(prepared), prepared);
+      for (const args of [input, prepared]) {
+        assert.equal((await call('viking_tree', args)).isError, undefined);
+        assert.deepEqual(calls.at(-1), ['tree', expected.uri === 'viking://' ? root : expected.uri, { depth: expected.depth, nodeLimit: expected.limit }]);
+      }
+    }
+  }
+});
+
+test('tree normalization preserves invalid types, bounds and namespace checks', async () => {
+  const { tools, call, calls } = fixture();
+  const tree = tools.get('viking_tree');
+  for (const args of [null, 7, [], { uri: null }, { uri: 9 }, { depth: '3' }, { depth: 0 }, { depth: 11 }, { depth: 1.5 }, { limit: 0 }, { limit: 1001 }, { limit: 1.5 }, { limit: null }, { unexpected: true }]) {
+    const prepared = tree.prepareArguments ? tree.prepareArguments(args) : args;
+    assert.equal(Value.Check(tree.parameters, prepared), false, JSON.stringify(args));
+    assert.equal((await call('viking_tree', args)).isError, true, JSON.stringify(args));
+  }
+  for (const uri of ['viking://user/bob', 'viking://user/alice/../bob', '']) {
+    assert.equal((await call('viking_tree', { uri })).isError, true);
+  }
+  assert.deepEqual(calls, []);
+});
+
+test('browse tree action uses the same bounded tree operation and preserves server failures', async () => {
+  const { tools, call, calls } = fixture();
+  const browse = tools.get('viking_browse');
+  for (const args of ['tree', { action: 'tree' }, { 0: 'tree', 1: 'viking://' }]) {
+    const prepared = browse.prepareArguments(args);
+    assert.ok(Value.Check(browse.parameters, prepared));
+    assert.equal((await call('viking_browse', prepared)).isError, undefined);
+    assert.deepEqual(calls.at(-1), ['tree', 'viking://user/alice', { depth: 3, nodeLimit: 100 }]);
+  }
+  const unavailableTree = fixture({ tree: async () => ({ ok: false, status: 503 }) });
+  for (const [name, args] of [['viking_browse', { action: 'tree' }], ['viking_tree', {}]]) {
+    const result = await unavailableTree.call(name, args);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /Could not read directory tree/);
+  }
+});
+
+test('read accepts a bare URI and defaults to abstract without overriding an explicit level', async () => {
+  const reads = [];
+  const { tools, call } = fixture(Object.fromEntries([
+    ['abstract', 'abstract'], ['overview', 'overview'], ['readContent', 'full'],
+  ].map(([method, level]) => [method, async uri => { reads.push([level, uri]); return level; }])));
+  const read = tools.get('viking_read');
+  const uri = 'viking://user/alice/memories/fact';
+  for (const [input, level] of [[uri, 'abstract'], [{ uri }, 'abstract'], [{ uri, level: 'overview' }, 'overview'], [{ uri, level: 'full' }, 'full']]) {
+    const prepared = read.prepareArguments?.(input) ?? input;
+    assert.ok(Value.Check(read.parameters, prepared));
+    assert.deepEqual(prepared, { uri, level });
+    assert.deepEqual(read.prepareArguments(prepared), prepared);
+    for (const args of [input, prepared]) {
+      assert.equal((await call('viking_read', args)).content[0].text, level);
+      assert.deepEqual(reads.at(-1), [level, uri]);
+    }
+  }
+  assert.equal(read.parameters.properties.level.default, 'abstract');
+});
+
+test('read still requires a valid authorized URI and rejects invalid levels and extra fields', async () => {
+  let reads = 0;
+  const { tools, call } = fixture({ abstract: async () => { reads++; return 'abstract'; } });
+  const read = tools.get('viking_read');
+  for (const args of [undefined, null, {}, 7, [], { uri: 7 }, { uri: null }, { uri: 'viking://user/alice/x', level: null }, { uri: 'viking://user/alice/x', level: 'summary' }, { uri: 'viking://user/alice/x', extra: true }]) {
+    const prepared = read.prepareArguments ? read.prepareArguments(args) : args;
+    assert.equal(Value.Check(read.parameters, prepared), false, JSON.stringify(args));
+    assert.equal((await call('viking_read', args)).isError, true);
+  }
+  for (const uri of ['viking://', 'viking://user/bob/x', 'viking://user/alice/../bob', '']) {
+    assert.equal((await call('viking_read', { uri })).isError, true);
+  }
+  assert.equal(reads, 0);
 });
 
 test('canonical URI rejects traversal, encodings, ambiguous separators and namespace prefix collision', async () => {

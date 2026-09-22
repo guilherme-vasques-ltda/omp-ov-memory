@@ -54,6 +54,7 @@ export interface ToolDefinition {
   label: string;
   description: string;
   parameters: TSchema;
+  prepareArguments?: (args: unknown) => unknown;
   execute: (id: string, params: any, signal?: AbortSignal, onUpdate?: any, ctx?: any) => Promise<any>;
   [key: string]: any;
 }
@@ -67,6 +68,33 @@ export function createTools(client: OVClient, sync: SyncManager | null, observe:
 const failure = (text: string) => ({ isError: true, content: [{ type: "text", text }] });
 const success = (text: string, details?: any) => ({ content: [{ type: "text", text }], ...(details === undefined ? {} : { details }) });
 
+/** Only omitted fields get defaults; invalid values and unknown keys remain for validation. */
+function withArgumentDefaults(args: unknown, defaults: Record<string, unknown>): unknown {
+  if (args === undefined) args = {};
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return args;
+  const prepared: Record<string, unknown> = { ...args };
+  for (const [key, value] of Object.entries(defaults)) {
+    if (prepared[key] === undefined) prepared[key] = value;
+  }
+  return prepared;
+}
+
+function prepareBrowseArguments(args: unknown): unknown {
+  if (typeof args === "string") args = args.startsWith("viking://") ? { uri: args } : { action: args };
+  if (args !== null && typeof args === "object" && !Array.isArray(args)) {
+    const prepared: Record<string, unknown> = { ...args };
+    // Recover positional object fields without hiding conflicting named values.
+    for (const [position, field] of [["0", "action"], ["1", "uri"]] as const) {
+      if (Object.hasOwn(prepared, position) && !Object.hasOwn(prepared, field)) {
+        prepared[field] = prepared[position];
+        delete prepared[position];
+      }
+    }
+    args = prepared;
+  }
+  return withArgumentDefaults(args, { action: "list", uri: "viking://" });
+}
+
 export function registerTools(api: any, client: OVClient, sync: SyncManager | null, observe: Observation = observation): void {
   const pi = { registerTool(tool: ToolDefinition) {
     const mutates = ["viking_remember", "viking_forget", "viking_add_resource", "viking_write", "viking_edit"].includes(tool.name);
@@ -75,6 +103,9 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
     const execute = tool.execute;
     (tool.parameters as any).additionalProperties = false;
     api.registerTool({ ...tool, async execute(id: string, params: any, signal?: AbortSignal, onUpdate?: any, ctx?: any) {
+      // Pi calls this before host validation; direct/MCP callers need the same
+      // idempotent normalization before our independent validation boundary.
+      if (tool.prepareArguments) params = tool.prepareArguments(params);
       if (!Value.Check(tool.parameters, params)) return failure("Invalid tool arguments; follow the tool's input schema.");
       if (signal?.aborted) return failure("Tool call cancelled.");
       if (client.cfg.sessionScopedMemory && tool.name !== "viking_health" && !parseVikingUri(client.userRoot)) return failure("Session memory namespace has not been bound yet.");
@@ -92,6 +123,11 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
   const unavailable = (tool: string): boolean => {
     observe.emit("tool_availability", tool, client.connected);
     return !client.connected;
+  };
+
+  const readTree = async (uri: string, depth = 3, limit = 100) => {
+    const result = await client.tree(uri, { depth, nodeLimit: limit });
+    return result.ok ? success(typeof result.result === "string" ? result.result : JSON.stringify(result.result, null, 2)) : failure("Could not read directory tree.");
   };
 
   const canonicalVikingUri = (input: unknown): string | null => parseVikingUri(input, client.userRoot);
@@ -216,11 +252,16 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
   pi.registerTool({
     name: "viking_read",
     label: "Viking Read",
-    description: "Read content at a viking:// URI. Three detail levels: 'abstract' (~100 tokens), 'overview' (~2k tokens), 'full' (complete). Start with abstract, escalate when needed.",
-    promptSnippet: "Read OpenViking content at a viking:// URI with tiered detail levels",
+    description: "Read content at a viking:// URI. Three detail levels: 'abstract' (~100 tokens, default), 'overview' (~2k tokens), 'full' (complete). Start with abstract, escalate when needed.",
+    promptSnippet: 'Read OpenViking content with {"uri":"viking://...","level":"abstract"}',
+    promptGuidelines: [
+      'Use viking_read with {"uri":"viking://...","level":"abstract"}; uri is required and level may be "abstract", "overview", or "full".',
+      'Omit level to read the abstract first, then request overview or full if needed.',
+    ],
+    prepareArguments: args => withArgumentDefaults(typeof args === "string" ? { uri: args } : args, { level: "abstract" }),
     parameters: Type.Object({
       uri: Type.String({ description: "viking:// URI to read" }),
-      level: StringEnum(["abstract", "overview", "full"] as const),
+      level: Type.Optional({ ...StringEnum(["abstract", "overview", "full"] as const), default: "abstract", description: "Detail level (default: abstract)" }),
     }),
     async execute(
       _id: string, params: any, _signal?: AbortSignal,
@@ -250,11 +291,17 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
   pi.registerTool({
     name: "viking_browse",
     label: "Viking Browse",
-    description: "Browse the OpenViking knowledge store like a filesystem. List directory contents or get metadata.",
-    promptSnippet: "Browse the viking:// directory tree in OpenViking",
+    description: "Browse the OpenViking knowledge store like a filesystem. List directory contents, get metadata, or inspect a bounded tree. Defaults to listing the active root.",
+    promptSnippet: 'Browse OpenViking with {"action":"list","uri":"viking://"}',
+    promptGuidelines: [
+      'Use viking_browse with {"action":"list","uri":"viking://..."}; action must be "list", "stat", or "tree". Omit action for list and uri for the active root.',
+      'In session-scoped mode, "viking://" means the active session root.',
+      'The tree action uses depth 3 and limit 100; use viking_tree to customize those bounds.',
+    ],
+    prepareArguments: prepareBrowseArguments,
     parameters: Type.Object({
-      action: StringEnum(["list", "stat"] as const),
-      uri: Type.Optional(Type.String({ description: "viking:// URI (default: 'viking://')" })),
+      action: Type.Optional({ ...StringEnum(["list", "stat", "tree"] as const), default: "list", description: "Directory operation (default: list); use viking_tree for custom tree depth/limit" }),
+      uri: Type.Optional(Type.String({ default: "viking://", description: "viking:// URI; defaults to the active root" })),
     }),
     async execute(
       _id: string, params: any, _signal?: AbortSignal,
@@ -266,10 +313,11 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
       // Browsing defaults to the namespace root so the model cannot enumerate
       // sibling sessions from `viking://`.
       const root = scoped();
-      const requested = params.uri ?? (root || "viking://");
+      const requested = params.uri === "viking://" ? (root || "viking://") : params.uri;
       const browse = authorizeUri(requested, "viking_browse", "browse", root);
       if (browse.error) return failure(browse.error);
       const uri = browse.uri!;
+      if (params.action === "tree") return readTree(uri);
       if (params.action === "stat") {
         const info = await client.stat(uri);
         if (!info) return { content: [{ type: "text", text: `Not found: ${uri}` }] };
@@ -519,17 +567,22 @@ export function registerTools(api: any, client: OVClient, sync: SyncManager | nu
   pi.registerTool({
     name: "viking_tree", label: "Viking Tree",
     description: "Inspect the OpenViking directory tree with bounded depth and node count.",
+    promptSnippet: 'Inspect an OpenViking tree with {"uri":"viking://","depth":3,"limit":100}',
+    promptGuidelines: [
+      'Use viking_tree with {"uri":"viking://...","depth":3,"limit":100}; {} uses the active root and these defaults.',
+      'Depth must be an integer from 1 to 10 and limit an integer from 1 to 1000. In session-scoped mode, "viking://" means the active session root.',
+    ],
+    prepareArguments: args => withArgumentDefaults(typeof args === "string" ? { uri: args } : args, { uri: "viking://", depth: 3, limit: 100 }),
     parameters: Type.Object({
-      uri: Type.Optional(Type.String()),
-      depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+      uri: Type.Optional(Type.String({ default: "viking://", description: "viking:// URI; defaults to the active root" })),
+      depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, default: 3, description: "Maximum directory depth (default: 3)" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, default: 100, description: "Maximum tree nodes (default: 100)" })),
     }),
     async execute(_id: string, params: any) {
       if (unavailable("viking_tree")) return failure("OpenViking server is not reachable.");
-      const access = authorizeUri(params.uri ?? (scoped() || "viking://"), "viking_tree", "browse");
+      const access = authorizeUri(params.uri === "viking://" ? (scoped() || "viking://") : params.uri, "viking_tree", "browse");
       if (access.error) return failure(access.error);
-      const result = await client.tree(access.uri!, { depth: params.depth ?? 3, nodeLimit: params.limit ?? 100 });
-      return result.ok ? success(typeof result.result === "string" ? result.result : JSON.stringify(result.result, null, 2)) : failure("Could not read directory tree.");
+      return readTree(access.uri!, params.depth, params.limit);
     },
   });
 
