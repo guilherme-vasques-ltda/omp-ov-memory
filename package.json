@@ -1,0 +1,61 @@
+{
+  "name": "omp-ov-memory",
+  "version": "0.1.0",
+  "description": "Durable OpenViking memory, recall and cross-agent handoff for OMP and Pi",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:live": "node scripts/live-smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "node --check extensions/openviking.ts"
+  },
+  "omp": {
+    "extensions": [
+      "./extensions/openviking.ts"
+    ],
+    "commands": [
+      "./commands/ov.md"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/openviking.ts"
+    ]
+  },
+  "files": [
+    "extensions/",
+    "src/",
+    "servers/",
+    "scripts/",
+    "skills/",
+    "commands/",
+    "config.json",
+    "plugin.json",
+    "mcp.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "docs/",
+    "marketplace.json",
+    ".omp-plugin/"
+  ],
+  "dependencies": {
+    "undici": "^7.16.0",
+    "@sinclair/typebox": "^0.34.41",
+    "smol-toml": "^1.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.2"
+  },
+  "keywords": [
+    "omp-plugin",
+    "pi-package",
+    "openviking",
+    "memory"
+  ]
+}

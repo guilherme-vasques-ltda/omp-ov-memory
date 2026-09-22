@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "syncTurns": true,
+  "recallTokenBudget": 2000,
+  "scoreThreshold": 0.35,
+  "minQueryLength": 3,
+  "profileTokenBudget": 10000,
+  "resumeContextBudget": 32000,
+  "commitTokenThreshold": 20000,
+  "sessionScopedMemory": true,
+  "workspacePeer": true,
+  "recallPeerScope": "all",
+  "captureMode": "denylist",
+  "captureAllowlist": [],
+  "captureDenylist": [],
+  "handoff": { "enabled": true },
+  "takeover": { "enabled": false, "tokenThreshold": 30000, "keepRecentTurns": 3 },
+  "archive": { "chunkTokenBudget": 50000, "rawTailTokenBudget": 20000 },
+  "bypassPatterns": [],
+  "logLevel": "error",
+  "requestTimeoutMs": 2000,
+  "stateDir": "~/.openviking/omp-ov-memory"
+}

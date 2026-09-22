@@ -1,0 +1,11 @@
+omp-ov-memory
+Copyright 2026 Guilherme Vasques and contributors
+
+This product includes software adapted from pi-openviking 0.4.4,
+Copyright its contributors, licensed under the Apache License, Version 2.0.
+The vendored engine is in src/shared and src/lib; client, config, sync, recall
+and tools were initially adapted from that package. Changes are documented
+in docs/provenance.md. The upstream Apache license is preserved as LICENSE.
+
+Design references: akitaonrails/ai-memory (MIT) and public feature descriptions
+of cortexc0de/omp-openviking-memory (AGPL-3.0). No AGPL implementation is included.

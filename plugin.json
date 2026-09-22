@@ -1,0 +1,12 @@
+{
+  "name": "omp-ov-memory",
+  "version": "0.1.0",
+  "description": "OpenViking durable memory and handoff for OMP",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Guilherme Vasques"
+  },
+  "extensions": [
+    "./extensions/openviking.ts"
+  ]
+}

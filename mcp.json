@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "omp-ov-memory": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/servers/mcp-proxy.mjs"
+      ]
+    }
+  }
+}

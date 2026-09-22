@@ -1,0 +1,19 @@
+{
+  "name": "omp-ov-memory-marketplace",
+  "owner": {
+    "name": "guilherme-vasques-ltda"
+  },
+  "metadata": {
+    "description": "OpenViking memory plugin for OMP",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "omp-ov-memory",
+      "source": "./",
+      "version": "0.1.0",
+      "description": "Durable memory, recall and cross-agent handoff",
+      "license": "Apache-2.0"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+node_modules/
+.omp/
+.env
+.env.*
+!.env.example
+*.tgz
+coverage/
+.DS_Store
